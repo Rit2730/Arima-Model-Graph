@@ -2,172 +2,174 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 from statsmodels.tsa.arima.model import ARIMA
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import plotly.express as px
+import seaborn as sns
 
-# ----------------------------
-# PAGE CONFIGURATION
-# ----------------------------
+# -----------------------------
+# Page Config
+# -----------------------------
 st.set_page_config(
-    page_title="Asian Paints ARIMA Forecasting Dashboard",
+    page_title="Financial Forecasting App",
     layout="wide",
-    initial_sidebar_state="expanded"
+    page_icon="📈"
 )
 
-# ----------------------------
-# HEADER
-# ----------------------------
-st.markdown("""
-# Asian Paints – ARIMA Forecasting Dashboard  
-A professional financial analytics app built with Streamlit.
-""")
+# -----------------------------
+# Sidebar Navigation
+# -----------------------------
+st.sidebar.title("📌 Dashboard")
+project = st.sidebar.radio("Select Project", ["Project 1 – ARIMA Forecast", "Project 2 – Advanced Technical Analysis"])
 
-# ----------------------------
-# SIDEBAR OPTIONS
-# ----------------------------
-st.sidebar.header("Model Settings")
+# -----------------------------
+# Helper: Load Data
+# -----------------------------
+def load_data(ticker, period="5y"):
+    try:
+        df = yf.download(ticker, period=period)
+        df = df.dropna()
+        return df
+    except Exception:
+        return None
 
-ticker = "ASIANPAINT.NS"
+# -----------------------------
+# PROJECT 1 - ARIMA FORECASTING
+# -----------------------------
+if project == "Project 1 – ARIMA Forecast":
 
-start_date = st.sidebar.date_input("Training Start Date", pd.to_datetime("2010-01-01"))
-end_date = st.sidebar.date_input("Training End Date", pd.to_datetime("2025-01-01"))
+    st.title("📈 Project 1: ARIMA Time Series Forecasting")
+    st.write("Upload a stock ticker and generate forecasting with ARIMA.")
 
-forecast_periods = st.sidebar.slider("Forecast Horizon (Months)", 6, 60, 12)
+    ticker = st.text_input("Enter Stock Symbol (Example: AAPL, RELIANCE.NS)", "AAPL")
 
-order_p = st.sidebar.number_input("ARIMA p", 0, 5, 1)
-order_d = st.sidebar.number_input("ARIMA d", 0, 2, 1)
-order_q = st.sidebar.number_input("ARIMA q", 0, 5, 1)
+    if st.button("Load Data"):
+        df = load_data(ticker)
 
-# ----------------------------
-# FETCH DATA
-# ----------------------------
-@st.cache_data
-def load_data(ticker):
-    return yf.download(ticker, period="20y", interval="1mo")
+        if df is None or len(df) < 200:
+            st.error("❌ Not enough data. Try a different stock or longer period.")
+        else:
+            st.success("Data loaded successfully!")
 
-df = load_data(ticker)
-df = df.dropna()
+            # Show data table
+            with st.expander("🔍 View Data"):
+                st.dataframe(df.tail())
 
-# Filter according to user input
-df_train = df.loc[start_date:end_date]["Close"]
+            # Actual Price Chart
+            st.subheader("📌 Actual Closing Price Chart")
+            fig1, ax1 = plt.subplots()
+            ax1.plot(df.index, df["Close"])
+            st.pyplot(fig1)
 
-st.subheader("Price Data (Filtered)")
-st.line_chart(df_train)
+            # ARIMA MODEL
+            st.subheader("📌 Building ARIMA Model")
 
-# ----------------------------
-# FIT ARIMA MODEL
-# ----------------------------
-with st.spinner("Fitting ARIMA model…"):
-    model = ARIMA(df_train, order=(order_p, order_d, order_q))
-    fitted = model.fit()
+            try:
+                model = ARIMA(df["Close"], order=(5,1,2))
+                model_fit = model.fit()
 
-st.success("Model fitted successfully!")
+                forecast_steps = 30
+                forecast = model_fit.forecast(steps=forecast_steps)
 
-# ----------------------------
-# FORECASTING
-# ----------------------------
-forecast = fitted.forecast(steps=forecast_periods)
+                # Forecast Chart
+                st.subheader("📌 Forecast Chart (Next 30 Days)")
+                fig2, ax2 = plt.subplots()
+                ax2.plot(df.index, df["Close"], label="Actual")
+                ax2.plot(forecast.index, forecast, label="Forecast", linestyle="--")
+                ax2.legend()
+                st.pyplot(fig2)
 
-# Ensure forecast is 1D
-forecast = pd.Series(np.array(forecast).flatten(), 
-                     index=pd.date_range(start=df_train.index[-1] + pd.offsets.MonthBegin(),
-                     periods=forecast_periods, freq="MS"))
+                # COMPARISON GRAPH
+                st.subheader("📌 Actual vs Forecast Comparison")
+                combined = pd.concat([df["Close"].tail(50), forecast])
+                fig3, ax3 = plt.subplots()
+                ax3.plot(combined.index, combined.values)
+                st.pyplot(fig3)
 
-# ----------------------------
-# FORECAST PLOT
-# ----------------------------
-st.subheader("Original vs Forecasted Prices")
+                # Download Forecast Button
+                st.download_button("📥 Download Forecast Data", forecast.to_csv(), "forecast.csv")
 
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=df_train.index, y=df_train.values, mode="lines", name="Actual"))
-fig.add_trace(go.Scatter(x=forecast.index, y=forecast.values, mode="lines", name="Forecast"))
+            except Exception as e:
+                st.error("Model Error: " + str(e))
 
-st.plotly_chart(fig, use_container_width=True)
 
-# ----------------------------
-# ACTUAL FUTURE DATA FOR COMPARISON
-# ----------------------------
-try:
-    df_actual_future = df.loc[forecast.index]["Close"]
-    df_actual_future = pd.Series(df_actual_future)
-    df_actual_future = df_actual_future.dropna()
+# -----------------------------
+# PROJECT 2 - ADVANCED TECHNICAL ANALYSIS
+# -----------------------------
+else:
+    st.title("📊 Project 2: Advanced Technical Analysis")
+    st.write("Includes Moving Averages, RSI, MACD, Volatility & Correlation Heatmap.")
 
-    # Align forecast to actual length
-    forecast_aligned = forecast[:len(df_actual_future)]
+    ticker2 = st.text_input("Enter Stock Symbol for Project 2 (Example: TSLA, INFY.NS)", "TSLA")
 
-    comparison = pd.DataFrame({
-        "Actual": df_actual_future.values,
-        "Forecast": forecast_aligned.values
-    }, index=df_actual_future.index)
+    if st.button("Load Project 2 Data"):
+        df2 = load_data(ticker2, period="3y")
 
-    st.subheader("Forecast vs Actual Comparison Table")
-    st.dataframe(comparison)
+        if df2 is None or len(df2) < 150:
+            st.error("❌ Not enough data")
+        else:
+            st.success("Data Loaded Successfully!")
 
-    # ----------------------------
-    # ACCURACY METRICS
-    # ----------------------------
-    mae = mean_absolute_error(df_actual_future, forecast_aligned)
-    rmse = np.sqrt(mean_squared_error(df_actual_future, forecast_aligned))
-    mape = np.mean(np.abs((df_actual_future - forecast_aligned) / df_actual_future)) * 100
+            # Moving Averages
+            df2["MA20"] = df2["Close"].rolling(20).mean()
+            df2["MA50"] = df2["Close"].rolling(50).mean()
 
-    st.subheader("Model Accuracy Metrics")
-    st.write(f"MAE: {mae:.3f}")
-    st.write(f"RMSE: {rmse:.3f}")
-    st.write(f"MAPE: {mape:.2f}%")
+            # RSI
+            delta = df2["Close"].diff()
+            gain = delta.where(delta > 0, 0)
+            loss = -delta.where(delta < 0, 0)
+            avg_gain = gain.rolling(14).mean()
+            avg_loss = loss.rolling(14).mean()
+            rs = avg_gain / avg_loss
+            df2["RSI"] = 100 - (100 / (1 + rs))
 
-except:
-    st.warning("Not enough future data available yet for comparison.")
+            # MACD
+            df2["EMA12"] = df2["Close"].ewm(span=12).mean()
+            df2["EMA26"] = df2["Close"].ewm(span=26).mean()
+            df2["MACD"] = df2["EMA12"] - df2["EMA26"]
+            df2["Signal"] = df2["MACD"].ewm(span=9).mean()
 
-# ----------------------------
-# RESIDUAL DIAGNOSTICS
-# ----------------------------
-st.subheader("Residual Diagnostics")
+            # VOLATILITY
+            df2["Volatility"] = df2["Close"].pct_change().rolling(20).std()
 
-residuals = fitted.resid
+            # -----------------------------
+            # GRAPHS
+            # -----------------------------
 
-fig_res = px.line(x=df_train.index, y=residuals, title="Residuals Over Time")
-st.plotly_chart(fig_res, use_container_width=True)
+            # 1. PRICE + MA
+            st.subheader("📌 Price with Moving Averages")
+            fig4, ax4 = plt.subplots()
+            ax4.plot(df2["Close"], label="Close")
+            ax4.plot(df2["MA20"], label="MA20")
+            ax4.plot(df2["MA50"], label="MA50")
+            ax4.legend()
+            st.pyplot(fig4)
 
-# ----------------------------
-# BASIC STATISTICS
-# ----------------------------
-st.subheader("Statistical Summary")
+            # 2. RSI
+            st.subheader("📌 RSI Indicator")
+            fig5, ax5 = plt.subplots()
+            ax5.plot(df2["RSI"])
+            ax5.axhline(30, linestyle="--")
+            ax5.axhline(70, linestyle="--")
+            st.pyplot(fig5)
 
-stats_df = pd.DataFrame({
-    "Metric": ["Mean Price", "Median Price", "Std Dev", "Min Price", "Max Price"],
-    "Value": [
-        df_train.mean(), df_train.median(),
-        df_train.std(), df_train.min(), df_train.max()
-    ]
-})
+            # 3. MACD
+            st.subheader("📌 MACD Indicator")
+            fig6, ax6 = plt.subplots()
+            ax6.plot(df2["MACD"], label="MACD")
+            ax6.plot(df2["Signal"], label="Signal")
+            ax6.legend()
+            st.pyplot(fig6)
 
-st.table(stats_df)
+            # 4. VOLATILITY
+            st.subheader("📌 Volatility Chart")
+            fig7, ax7 = plt.subplots()
+            ax7.plot(df2["Volatility"])
+            st.pyplot(fig7)
 
-# ----------------------------
-# DOWNLOAD SECTION
-# ----------------------------
-st.subheader("Download Data")
+            # 5. Correlation Heatmap
+            st.subheader("📌 Correlation Heatmap")
+            fig8, ax8 = plt.subplots()
+            sns.heatmap(df2[["Close","MA20","MA50","RSI","MACD","Volatility"]].corr(), annot=True, ax=ax8)
+            st.pyplot(fig8)
 
-csv_data = df.to_csv().encode()
-st.download_button("Download Full Dataset (CSV)", csv_data, "asianpaints_data.csv", "text/csv")
-
-forecast_csv = forecast.to_csv().encode()
-st.download_button("Download Forecast (CSV)", forecast_csv, "forecast.csv", "text/csv")
-
-# ----------------------------
-# OBSERVATIONS
-# ----------------------------
-st.subheader("Professional Observation")
-
-st.write("""
-The ARIMA forecasting model fitted on Asian Paints stock data demonstrates a consistent 
-price trend with moderate deviation from actual market performance in the forecast horizon. 
-Residual diagnostics confirm stability with no major autocorrelation, suggesting a suitable 
-model fit.  
-Shorter horizons provide higher accuracy, while longer-term monthly forecasts show expected 
-volatility due to market behaviour.  
-This dashboard integrates analytical statistics, diagnostics, and visualization, 
-providing a complete forecasting environment for financial research and investment insights.
-""")
+            st.download_button("📥 Download Technical Data", df2.to_csv(), "technical.csv")
