@@ -11,32 +11,41 @@ from io import BytesIO
 import warnings
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Asian Paints — ARIMA Dashboard (NIFTY default)", layout="wide")
+st.set_page_config(page_title="ARIMA Forecasting — NIFTY (monthly close)", layout="wide")
 
 # ---------------------------
-# Utility functions
+# Utility helpers (defensive)
 # ---------------------------
-def fetch_monthly(ticker, start, end):
-    """Fetch monthly close prices (month-start normalized)."""
-    df = yf.download(ticker, start=start, end=end, interval="1mo", progress=False)
-    if df is None or "Close" not in df.columns:
-        return pd.Series(dtype=float)
-    s = df["Close"].dropna().copy()
+def fetch_daily(ticker, start, end):
+    df = yf.download(ticker, start=start, end=end, progress=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df.index = pd.to_datetime(df.index)
+    return df
+
+def monthly_close(series_or_df):
+    """Return monthly close series (month-end) using last observed Close of month."""
+    if isinstance(series_or_df, pd.DataFrame):
+        if "Close" not in series_or_df.columns:
+            raise ValueError("Input DataFrame must have a 'Close' column.")
+        s = series_or_df["Close"].resample("M").last().dropna()
+    else:
+        s = pd.Series(series_or_df).resample("M").last().dropna()
     s.index = pd.to_datetime(s.index).to_period("M").to_timestamp()
     s.name = "price"
-    return s.sort_index()
+    return s
 
-def to_1d(s):
-    """Ensure series/data are 1-D numeric pandas Series with datetime index if present."""
-    if isinstance(s, pd.DataFrame):
-        if "price" in s.columns:
-            s = s["price"].copy()
+def to_series_1d(x):
+    """Ensure result is a pandas Series (1-D) with datetime index when possible."""
+    if isinstance(x, pd.DataFrame):
+        if "price" in x.columns:
+            s = x["price"].copy()
         else:
-            s = s.iloc[:, 0].copy()
-    elif isinstance(s, np.ndarray):
-        s = pd.Series(s.ravel())
+            s = x.iloc[:, 0].copy()
+    elif isinstance(x, pd.Series):
+        s = x.copy()
     else:
-        s = pd.Series(s)
+        s = pd.Series(x)
     s = pd.to_numeric(s, errors="coerce").dropna()
     try:
         s.index = pd.to_datetime(s.index).to_period("M").to_timestamp()
@@ -45,23 +54,23 @@ def to_1d(s):
     s.name = "price"
     return s
 
-def fit_arima_forecast(train_series, order=(1,1,1), steps=12, start_period=None):
-    s = to_1d(train_series)
+def fit_arima_and_forecast(train_series, order=(1,1,1), steps=12, forecast_start=None):
+    s = to_series_1d(train_series)
     if len(s) < 6:
-        raise ValueError("Insufficient monthly points to fit ARIMA (need >=6).")
+        raise ValueError("Not enough monthly points to fit ARIMA (>=6 required).")
     model = ARIMA(s, order=order)
     fitted = model.fit()
-    res = fitted.get_forecast(steps=steps)
-    mean = pd.Series(np.array(res.predicted_mean).flatten())
-    ci = res.conf_int()
+    fc_res = fitted.get_forecast(steps=steps)
+    mean = pd.Series(np.array(fc_res.predicted_mean).flatten())
+    ci = fc_res.conf_int()
     lower = pd.Series(np.array(ci.iloc[:,0]).flatten())
     upper = pd.Series(np.array(ci.iloc[:,1]).flatten())
-    # Determine forecast index safely
-    if start_period is None:
-        idx_start = s.index[-1] + pd.offsets.MonthBegin()
+    # Build forecast index starting at forecast_start or next month after train
+    if forecast_start is None:
+        start_idx = s.index[-1] + pd.offsets.MonthBegin()
     else:
-        idx_start = pd.to_datetime(start_period)
-    idx = pd.date_range(start=idx_start, periods=steps, freq="MS")
+        start_idx = pd.to_datetime(forecast_start)
+    idx = pd.date_range(start=start_idx, periods=steps, freq="MS")
     mean.index = idx
     lower.index = idx
     upper.index = idx
@@ -81,7 +90,7 @@ def plot_overlay(history, forecast, actual=None, lower=None, upper=None, title="
     if history is not None and len(history) > 0:
         fig.add_trace(go.Scatter(x=history.index, y=history.values, mode="lines", name="History", line=dict(width=2)))
     fig.add_trace(go.Scatter(x=forecast.index, y=forecast.values, mode="lines", name="Forecast", line=dict(width=2, dash="dash")))
-    if (lower is not None) and (upper is not None) and len(lower)==len(upper)==len(forecast):
+    if (lower is not None) and (upper is not None) and (len(lower)==len(upper)==len(forecast)):
         fig.add_trace(go.Scatter(x=upper.index, y=upper.values, mode="lines", line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=lower.index, y=lower.values, mode="lines", fill='tonexty', fillcolor='rgba(173,216,230,0.2)', name="95% CI", line=dict(width=0)))
     if actual is not None and len(actual) > 0:
@@ -91,8 +100,8 @@ def plot_overlay(history, forecast, actual=None, lower=None, upper=None, title="
     return fig
 
 def compute_metrics(actual, forecast):
-    a = to_1d(actual)
-    f = to_1d(forecast)
+    a = to_series_1d(actual)
+    f = to_series_1d(forecast)
     n = min(len(a), len(f))
     if n == 0:
         return np.nan, np.nan, np.nan
@@ -104,14 +113,13 @@ def compute_metrics(actual, forecast):
     return mae, rmse, mape
 
 def acf_pacf_figs(series, nlags=24):
-    s = to_1d(series)
+    s = to_series_1d(series)
     if len(s) < 2:
-        # empty fallback
         empty = go.Figure()
         empty.update_layout(title="Not enough data")
         return empty, empty
     acf_vals = acf(s, nlags=nlags, fft=False, missing='conservative')
-    # use stable method 'ywmle' for pacf to avoid method errors
+    # use ywmle (stable) for pacf to avoid errors
     pacf_vals = pacf(s, nlags=nlags, method='ywmle')
     fig_acf = go.Figure(go.Bar(x=list(range(len(acf_vals))), y=acf_vals))
     fig_acf.update_layout(title="ACF", template="simple_white", height=320)
@@ -126,12 +134,11 @@ def df_to_bytes(df):
     return buf
 
 # ---------------------------
-# App UI & Logic
+# App UI & flow
 # ---------------------------
-st.title("ARIMA Forecasting Dashboard — NIFTY (default)")
+st.title("ARIMA Forecasting Dashboard — NIFTY (monthly close)")
 
-st.sidebar.header("Configuration")
-# default ticker ^NSEI for NIFTY
+st.sidebar.header("Settings")
 ticker = st.sidebar.text_input("Ticker (Yahoo Finance)", value="^NSEI")
 project = st.sidebar.selectbox("Project", ["Project 1 (2010–2018 → 2019)", "Project 2 (2021–2025 → 2026)"])
 p = int(st.sidebar.number_input("ARIMA p", min_value=0, max_value=5, value=1))
@@ -140,19 +147,27 @@ q = int(st.sidebar.number_input("ARIMA q", min_value=0, max_value=5, value=1))
 order = (p, d, q)
 forecast_horizon = int(st.sidebar.slider("Forecast months (out-of-sample)", min_value=6, max_value=24, value=12))
 
-# optional: show uploaded image path in sidebar
+# show uploaded image path (developer-provided)
 st.sidebar.markdown("Reference image (local):")
 st.sidebar.write("/mnt/data/error.png")
+# show actual image
+try:
+    st.sidebar.image("/mnt/data/error.png", width=200)
+except Exception:
+    pass
 
-# fetch full series once (wide window to cover both projects)
-with st.spinner("Fetching monthly series from Yahoo Finance..."):
-    series_full = fetch_monthly(ticker, start="2000-01-01", end=pd.Timestamp.today().strftime("%Y-%m-%d"))
+# fetch raw daily data wide enough for both projects
+with st.spinner("Fetching data from Yahoo Finance..."):
+    raw = fetch_daily(ticker, start="2009-01-01", end=pd.Timestamp.today().strftime("%Y-%m-%d"))
 
-if series_full.empty:
-    st.error("Failed to fetch series. Confirm ticker symbol and internet access.")
+if raw.empty:
+    st.error("No data returned from Yahoo Finance. Check ticker or network.")
     st.stop()
 
-# Project-specific ranges
+# build monthly close series (month-end last close)
+monthly = monthly_close(raw)
+
+# select project windows
 if project.startswith("Project 1"):
     train_start, train_end = "2010-01-01", "2018-12-31"
     actual_start, actual_end = "2019-01-01", "2019-12-31"
@@ -164,41 +179,38 @@ else:
 
 st.header(title)
 
-train = series_full.loc[train_start:train_end]
-actual = series_full.loc[actual_start:actual_end]
+train = monthly.loc[train_start:train_end]
+actual = monthly.loc[actual_start:actual_end]
 
-# Graph 1: Monthly Price Movement (training)
+# Graph 1: monthly movement
 st.subheader("1) Monthly Price Movement (Training)")
 if len(train) == 0:
-    st.info("Training window has no data — please verify ticker or date ranges.")
+    st.info("Training window has no monthly-close data — please check ticker and date ranges.")
 else:
-    st.plotly_chart(plot_line(train, f"Monthly Price Movement — {train_start[:4]} to {train_end[:4]}"), use_container_width=True)
+    st.plotly_chart(plot_line(train, f"Monthly Close — {train_start[:4]} to {train_end[:4]}"), use_container_width=True)
 
-# Fit ARIMA + Forecast (forecast start is the first month of actual window)
+# Fit ARIMA and forecast
 try:
-    fitted, forecast_mean, lower_ci, upper_ci = fit_arima_forecast(train, order=order, steps=forecast_horizon, start_period=actual_start)
+    fitted, forecast_mean, lower_ci, upper_ci = fit_arima_and_forecast(train, order=order, steps=forecast_horizon, forecast_start=actual_start)
 except Exception as e:
     st.error(f"ARIMA fit failed: {e}")
     st.stop()
 
-# Graph 2: ARIMA forecast overlaid on actual (plots overlapping actual months only)
+# Graph 2: overlay
 st.subheader("2) ARIMA Forecast Overlaid on Actual")
-st.plotly_chart(plot_overlay(train, forecast_mean, actual=actual, lower=lower_ci, upper=upper_ci, title="ARIMA Forecast Overlaid on Actual"), use_container_width=True)
+st.plotly_chart(plot_overlay(train, forecast_mean, actual=actual, lower=lower_ci, upper=upper_ci, title="History + Forecast"), use_container_width=True)
 
-# Graph 3: Forecast only (out-of-sample)
+# Graph 3: forecast only
 st.subheader("3) Forecast (Out-of-Sample)")
-st.plotly_chart(plot_line(forecast_mean, f"Out-of-Sample Forecast starting {forecast_mean.index[0].strftime('%Y-%m')}", name="Forecast"), use_container_width=True)
+st.plotly_chart(plot_line(forecast_mean, f"Out-of-Sample Forecast starting {forecast_mean.index[0].strftime('%Y-%m')}"), use_container_width=True)
 
-# Forecast vs Actual comparison (align using min_len)
+# Forecast vs Actual comparison table and metrics (overlapping months)
 st.subheader("Forecast vs Actual Comparison")
-actual_1d = to_1d(actual)
-forecast_1d = to_1d(forecast_mean)
+actual_1d = to_series_1d(actual)
+forecast_1d = to_series_1d(forecast_mean)
 min_len = min(len(actual_1d), len(forecast_1d))
 if min_len > 0:
-    comp_df = pd.DataFrame({
-        "Actual": actual_1d.values[:min_len],
-        "Forecast": forecast_1d.values[:min_len]
-    }, index=actual_1d.index[:min_len])
+    comp_df = pd.DataFrame({"Actual": actual_1d.values[:min_len], "Forecast": forecast_1d.values[:min_len]}, index=actual_1d.index[:min_len])
     st.dataframe(comp_df.style.format("{:.2f}"))
     mae, rmse, mape = compute_metrics(actual_1d[:min_len], forecast_1d[:min_len])
     c1, c2, c3 = st.columns(3)
@@ -206,33 +218,36 @@ if min_len > 0:
     c2.metric("RMSE", f"{rmse:.3f}")
     c3.metric("MAPE", f"{mape:.2f}%")
 else:
-    st.info("No actual monthly data found for the forecast window. Forecast is still shown for presentation.")
+    st.info("No actual monthly-close data for the forecast window. Forecast is shown for presentation.")
     st.dataframe(forecast_mean.to_frame("Forecast").style.format("{:.2f}"))
 
 # Residual diagnostics
 st.subheader("Residual Diagnostics")
-resid = to_1d(fitted.resid)
-st.plotly_chart(plot_line(resid, "Residuals (Training)"), use_container_width=True)
+resid = to_series_1d(fitted.resid)
+st.plotly_chart(plot_line(resid, "Residuals — Training"), use_container_width=True)
 fig_acf, fig_pacf = acf_pacf_figs(train, nlags=24)
 st.plotly_chart(fig_acf, use_container_width=True)
 st.plotly_chart(fig_pacf, use_container_width=True)
 
-# Statistical summary (robust)
+# Statistical summary (safe)
 st.subheader("Statistical Summary (Training)")
 desc = train.describe()
 desc_df = desc.reset_index()
 desc_df.columns = ["Statistic", "Value"]
 st.table(desc_df)
 
-# Downloads & observation
+# Downloads (convert everything to DataFrame first to avoid numpy .to_frame errors)
 st.subheader("Downloads")
-st.download_button("Download training series (CSV)", data=df_to_bytes(train.to_frame("price")), file_name=f"train_{train_start}_{train_end}.csv")
-st.download_button("Download forecast (CSV)", data=df_to_bytes(forecast_mean.to_frame("forecast")), file_name=f"forecast_{forecast_mean.index[0].strftime('%Y%m')}.csv")
+train_df = train.to_frame(name="price")
+forecast_df = forecast_mean.to_frame(name="forecast")
+st.download_button("Download training series (CSV)", data=df_to_bytes(train_df), file_name=f"train_{train_start}_{train_end}.csv")
+st.download_button("Download forecast (CSV)", data=df_to_bytes(forecast_df), file_name=f"forecast_{forecast_mean.index[0].strftime('%Y%m')}.csv")
 if min_len > 0:
     st.download_button("Download comparison (CSV)", data=df_to_bytes(comp_df), file_name="comparison.csv")
 
+# Observation
 st.subheader("Observation")
 st.write(
-    "ARIMA model trained on the selected historical window and used to generate a monthly out-of-sample forecast. "
-    "Comparison metrics and residual diagnostics are provided. Where actual monthly data for the forecast window exists, the model is evaluated on those months; otherwise the forecast is presented for the full horizon to ensure a complete professional presentation."
+    "The ARIMA model is trained on monthly close prices and produces an out-of-sample monthly forecast. "
+    "Comparison metrics and residual diagnostics are shown for model validation. If actual monthly-close values exist for the forecast window they are used for direct comparison; otherwise the forecast is presented fully so the dashboard remains complete for presentation."
 )
