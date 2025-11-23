@@ -1,41 +1,21 @@
+# app.py
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+import yfinance as yf
 from statsmodels.tsa.arima.model import ARIMA
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-import plotly.graph_objects as go
-import plotly.express as px
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-import matplotlib.pyplot as plt
-from io import BytesIO
+import warnings
+warnings.filterwarnings("ignore")
 
-# ----------------------
-# Page config
-# ----------------------
 st.set_page_config(page_title="Asian Paints — ARIMA Dashboard", layout="wide")
 
-st.title("Asian Paints — ARIMA Forecasting Dashboard")
-st.write("Two independent projects. Monthly data used. ARIMA only. Professional plots, diagnostics, metrics and downloads.")
-
-# ----------------------
-# Helper utilities
-# ----------------------
-@st.cache_data
-def load_monthly_close(ticker="ASIANPAINT.NS", period="25y"):
-    df = yf.download(ticker, interval="1mo", period=period)
-    if df is None or "Close" not in df.columns:
-        raise RuntimeError("Failed to fetch Close prices for ticker.")
-    s = df["Close"].dropna().copy()
-    # normalize index to month start timestamps
-    s.index = pd.to_datetime(s.index).to_period("M").to_timestamp()
-    s.name = "price"
-    return s.sort_index()
-
-def ensure_series_1d(x):
-    """Return a clean 1-D pandas Series indexed by timestamp."""
+# ---- helpers ----
+def safe_series(x):
+    """Return a 1-D pandas Series of numeric values indexed by timestamps when possible."""
     if isinstance(x, pd.DataFrame):
-        # if dataframe has a 'price' or single column, select it
+        # prefer column named 'price' if exists
         if "price" in x.columns:
             s = x["price"].copy()
         else:
@@ -44,277 +24,214 @@ def ensure_series_1d(x):
         s = x.copy()
     else:
         s = pd.Series(x)
-    # flatten and ensure numeric
-    s = pd.Series(np.array(s).flatten(), index=s.index if hasattr(s, "index") else None)
+    # coerce numbers, drop NaN, normalize index to month start if present
     s = pd.to_numeric(s, errors="coerce").dropna()
-    s.index = pd.to_datetime(s.index).to_period("M").to_timestamp()
+    if hasattr(s, "index"):
+        try:
+            s.index = pd.to_datetime(s.index).to_period("M").to_timestamp()
+        except Exception:
+            pass
     s.name = "price"
     return s
 
-def fit_arima_safe(series, order=(1,1,1)):
-    s = ensure_series_1d(series)
+def fetch_yfinance_monthly(ticker="ASIANPAINT.NS", period="25y"):
+    """Fetch monthly close prices from yfinance and return 1-D Series."""
+    df = yf.download(ticker, interval="1mo", period=period, progress=False)
+    if df is None or "Close" not in df.columns or df["Close"].dropna().empty:
+        return pd.Series(dtype=float)
+    s = df["Close"].dropna().copy()
+    s.index = pd.to_datetime(s.index).to_period("M").to_timestamp()
+    s.name = "price"
+    return s.sort_index()
+
+def fit_arima_and_forecast(series, order=(1,1,1), steps=12, start_period=None):
+    s = safe_series(series)
+    if len(s) < 6:
+        raise ValueError("Not enough data points to fit ARIMA.")
     model = ARIMA(s, order=order)
     fitted = model.fit()
-    return fitted
-
-def forecast_with_ci(fitted, steps, start_month):
-    """Return forecast series, lower and upper CI. start_month is a Timestamp or 'YYYY-MM-01'"""
-    # Get forecast result with conf_int
-    res = fitted.get_forecast(steps=steps)
-    mean = pd.Series(np.array(res.predicted_mean).flatten())
-    ci = res.conf_int(alpha=0.05)
-    lower = pd.Series(np.array(ci.iloc[:, 0]).flatten())
-    upper = pd.Series(np.array(ci.iloc[:, 1]).flatten())
-
-    index = pd.date_range(start=pd.to_datetime(start_month), periods=steps, freq="MS")
+    # forecast
+    fc_res = fitted.get_forecast(steps=steps)
+    mean = pd.Series(np.array(fc_res.predicted_mean).flatten())
+    ci = fc_res.conf_int()
+    lower = pd.Series(np.array(ci.iloc[:,0]).flatten())
+    upper = pd.Series(np.array(ci.iloc[:,1]).flatten())
+    # build index for forecast (monthly starts)
+    if start_period is None:
+        # start right after last training month
+        idx_start = s.index[-1] + pd.offsets.MonthBegin()
+    else:
+        idx_start = pd.to_datetime(start_period)
+    index = pd.date_range(start=idx_start, periods=steps, freq="MS")
     mean.index = index
     lower.index = index
     upper.index = index
     mean.name = "forecast"
     lower.name = "lower"
     upper.name = "upper"
-    return mean, lower, upper
+    return fitted, mean, lower, upper
 
 def compute_metrics(actual, forecast):
-    # align lengths
-    actual = ensure_series_1d(actual)
-    forecast = ensure_series_1d(forecast)
-    n = min(len(actual), len(forecast))
+    a = safe_series(actual)
+    f = safe_series(forecast)
+    n = min(len(a), len(f))
     if n == 0:
         return (np.nan, np.nan, np.nan)
-    a = actual.values[:n].astype(float)
-    f = forecast.values[:n].astype(float)
+    a = a.values[:n].astype(float)
+    f = f.values[:n].astype(float)
     mae = mean_absolute_error(a, f)
     rmse = np.sqrt(mean_squared_error(a, f))
     mape = np.mean(np.abs((a - f) / a)) * 100 if np.any(a != 0) else np.nan
     return mae, rmse, mape
 
-def df_to_bytes(df):
+def df_to_csv_bytes(df):
+    from io import BytesIO
     buf = BytesIO()
-    df.to_csv(buf, index=True)
+    df.to_csv(buf)
     buf.seek(0)
     return buf
 
-# ----------------------
-# Load base series
-# ----------------------
-with st.spinner("Loading monthly price series from Yahoo Finance..."):
-    series_full = load_monthly_close()  # monthly series of 'price'
-
-# Sidebar: ARIMA order and UI controls
-st.sidebar.header("Model & View Options")
-p = st.sidebar.number_input("ARIMA p", min_value=0, max_value=5, value=1, step=1)
-d = st.sidebar.number_input("ARIMA d", min_value=0, max_value=2, value=1, step=1)
-q = st.sidebar.number_input("ARIMA q", min_value=0, max_value=5, value=1, step=1)
-order = (int(p), int(d), int(q))
-
-project_choice = st.sidebar.radio("Select Project", ("Project 1: 2010–2018 → Forecast 2019", "Project 2: 2021–2025 → Forecast 2026 (with backtest)"))
-
-# Common UI function to render interactive overlay chart
-def plot_actual_and_forecast(actual_series, forecast_mean, lower=None, upper=None, title="Actual vs Forecast"):
+def plot_actual_forecast(actual, forecast, lower=None, upper=None, title="Actual vs Forecast"):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=actual_series.index, y=actual_series.values, mode="lines", name="Actual", line=dict(width=2)))
-    fig.add_trace(go.Scatter(x=forecast_mean.index, y=forecast_mean.values, mode="lines", name="Forecast", line=dict(width=2, dash="dash")))
-    if lower is not None and upper is not None:
-        fig.add_trace(go.Scatter(x=lower.index, y=upper.values, fill='tonexty', fillcolor='rgba(180,180,255,0.2)',
-                                  name="95% CI", line=dict(width=0), hoverinfo="skip"))
-        # draw lower bound as invisible trace so fill works
-        fig.add_trace(go.Scatter(x=lower.index, y=lower.values, mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False))
-    fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Price", height=450)
+    if len(actual) > 0:
+        fig.add_trace(go.Scatter(x=actual.index, y=actual.values, mode="lines", name="Actual", line=dict(width=2)))
+    fig.add_trace(go.Scatter(x=forecast.index, y=forecast.values, mode="lines", name="Forecast", line=dict(width=2, dash="dash")))
+    if (lower is not None) and (upper is not None) and len(lower)==len(upper)==len(forecast):
+        fig.add_trace(go.Scatter(x=upper.index, y=upper.values, mode="lines", line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=lower.index, y=lower.values, mode="lines", fill='tonexty', fillcolor='rgba(173,216,230,0.2)', name="95% CI", line=dict(width=0)))
+    fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Price", template="simple_white", height=480)
     st.plotly_chart(fig, use_container_width=True)
 
-# ----------------------
-# Project 1
-# ----------------------
-if project_choice.startswith("Project 1"):
-    st.header("Project 1 — Train: 2010–2018 | Forecast: 2019")
-    train_start = "2010-01-01"
-    train_end = "2018-12-31"
-    forecast_start = "2019-01-01"
-    # Prepare training series
-    train_series = series_full.loc[train_start:train_end]
-    train_series = ensure_series_1d(train_series)
+# ---- UI ----
+st.header("Asian Paints — ARIMA Forecasting Dashboard")
+st.write("Two project views: Project 1 (2010–2018 → forecast 2019) and Project 2 (2021–2025 → forecast 2026). Use the sidebar to select and run.")
 
-    # Graph 1: Monthly Price Movement (train)
-    st.subheader("1) Monthly Price Movement (2010–2018)")
-    fig_a = px.line(x=train_series.index, y=train_series.values, labels={"x":"Date","y":"Price"}, title="Price (2010–2018)")
-    st.plotly_chart(fig_a, use_container_width=True)
+st.sidebar.header("Options")
+project = st.sidebar.selectbox("Project", ["Project 1", "Project 2"])
+p = st.sidebar.number_input("ARIMA p", min_value=0, max_value=5, value=1)
+d = st.sidebar.number_input("ARIMA d", min_value=0, max_value=2, value=1)
+q = st.sidebar.number_input("ARIMA q", min_value=0, max_value=5, value=1)
+order = (int(p), int(d), int(q))
+forecast_months = st.sidebar.slider("Forecast months (out of sample)", 1, 24, 12)
 
-    # Fit ARIMA safely
-    with st.spinner("Fitting ARIMA model for Project 1..."):
-        fitted1 = fit_arima_safe(train_series, order=order)
+# load data once
+with st.spinner("Fetching monthly series from Yahoo Finance..."):
+    series_full = fetch_yfinance_monthly(ticker="ASIANPAINT.NS", period="25y")
+if series_full.empty:
+    st.error("Failed to fetch data from Yahoo Finance. Confirm ticker and try again. App will stop.")
+    st.stop()
 
-    # Forecast 12 months for 2019 with CI
-    fmean1, lower1, upper1 = forecast_with_ci(fitted1, steps=12, start_month=forecast_start)
-
-    # Graph 2: Forecast overlaid on actual (if actual exists)
-    st.subheader("2) ARIMA Forecast Overlaid on Actual")
-    # overlay train + forecast; add actual 2019 if available
+if project == "Project 1":
+    st.subheader("Project 1 — Train 2010–2018, Forecast 2019")
+    train = series_full.loc["2010-01-01":"2018-12-31"]
     actual_2019 = series_full.loc["2019-01-01":"2019-12-31"]
-    actual_2019 = ensure_series_1d(actual_2019)
-    plot_actual_and_forecast(pd.concat([train_series, actual_2019]) if len(actual_2019)>0 else train_series, fmean1, lower1, upper1, title="ARIMA Forecast vs Actual (with forecasted 2019)")
 
-    # Graph 3: Future Forecast (2019)
-    st.subheader("3) Future Forecast (2019 — Out of sample)")
-    fig_fore = px.line(x=fmean1.index, y=fmean1.values, labels={"x":"Date","y":"Forecast"}, title="Forecasted Monthly Prices (2019)")
-    st.plotly_chart(fig_fore, use_container_width=True)
+    st.markdown("### Graph 1 — Monthly price movement (2010–2018)")
+    fig = go.Figure(go.Scatter(x=train.index, y=train.values, mode="lines", name="Train"))
+    fig.update_layout(template="simple_white", xaxis_title="Date", yaxis_title="Price", height=360)
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Forecast vs Actual Comparison table
-    st.subheader("Forecast vs Actual Comparison (2019)")
-    # align lengths
-    minlen = min(len(actual_2019), len(fmean1))
-    if minlen > 0:
-        comp_idx = actual_2019.index[:minlen]
-        comp_df = pd.DataFrame({
-            "Actual": actual_2019.values[:minlen],
-            "Forecast": fmean1.values[:minlen]
-        }, index=comp_idx)
+    # fit & forecast
+    fitted1, mean1, lower1, upper1 = fit_arima_and_forecast(train, order=order, steps=forecast_months, start_period="2019-01-01")
+
+    st.markdown("### Graph 2 — ARIMA forecast overlaid on history and actuals")
+    plot_actual_forecast(pd.concat([train, actual_2019]) if len(actual_2019)>0 else train, mean1, lower1, upper1, title="Training + Forecast (2019)")
+
+    st.markdown("### Graph 3 — Forecast only (2019 forecast months)")
+    fig_fc = go.Figure(go.Scatter(x=mean1.index, y=mean1.values, mode="lines", name="Forecast"))
+    fig_fc.update_layout(template="simple_white", xaxis_title="Date", yaxis_title="Forecasted Price", height=360)
+    st.plotly_chart(fig_fc, use_container_width=True)
+
+    # Comparison table & metrics
+    st.markdown("### Forecast vs Actual (2019)")
+    min_len = min(len(actual_2019), len(mean1))
+    if min_len > 0:
+        comp_df = pd.DataFrame({"Actual": actual_2019.values[:min_len], "Forecast": mean1.values[:min_len]}, index=actual_2019.index[:min_len])
+        st.dataframe(comp_df.style.format("{:.2f}"))
+        mae, rmse, mape = compute_metrics(comp_df["Actual"], comp_df["Forecast"])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("MAE", f"{mae:.3f}")
+        c2.metric("RMSE", f"{rmse:.3f}")
+        c3.metric("MAPE", f"{mape:.2f}%")
     else:
-        # fallback: show forecast values (still present)
-        comp_df = pd.DataFrame({
-            "Forecast": fmean1.values
-        }, index=fmean1.index)
-    st.dataframe(comp_df.style.format("{:.2f}"))
+        st.info("No actual monthly values found for 2019 in the dataset. Forecast table is shown above.")
 
-    # Metrics
-    if "Actual" in comp_df.columns:
-        mae1, rmse1, mape1 = compute_metrics(comp_df["Actual"], comp_df["Forecast"])
-        st.subheader("Metrics")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("MAE", f"{mae1:.3f}")
-        col2.metric("RMSE", f"{rmse1:.3f}")
-        col3.metric("MAPE", f"{mape1:.2f} %")
-    else:
-        st.info("Actual monthly data for 2019 was not found. Backtest metrics are not shown but forecast is available for download and presentation.")
+    # diagnostics
+    st.markdown("### Residuals (training)")
+    resid = fitted1.resid
+    fig_res = go.Figure(go.Scatter(x=resid.index, y=resid.values, mode="lines", name="Residuals"))
+    fig_res.update_layout(template="simple_white", height=300)
+    st.plotly_chart(fig_res, use_container_width=True)
 
-    # Residual diagnostics
-    st.subheader("Residual Diagnostics (Training period)")
-    resid1 = fitted1.resid
-    fig_res, ax = plt.subplots(figsize=(8, 3))
-    ax.plot(resid1)
-    ax.set_title("Residuals (Train)")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Residual")
-    st.pyplot(fig_res)
+    st.markdown("### Statistical summary (training)")
+    st.table(train.describe().to_frame("value"))
 
-    # ACF / PACF
-    st.subheader("ACF and PACF (Training series)")
-    fig_acf, ax_acf = plt.subplots(1, 2, figsize=(12, 3))
-    plot_acf(train_series, ax=ax_acf[0], lags=24, zero=False)
-    plot_pacf(train_series, ax=ax_acf[1], lags=24, zero=False, method='ywm')
-    st.pyplot(fig_acf)
+    # downloads and observation
+    st.download_button("Download training series (CSV)", data=df_to_csv_bytes(train.to_frame("price")), file_name="project1_train_2010_2018.csv")
+    st.download_button("Download forecast (CSV)", data=df_to_csv_bytes(mean1.to_frame("forecast")), file_name="project1_forecast_2019.csv")
+    if min_len > 0:
+        st.download_button("Download comparison (CSV)", data=df_to_csv_bytes(comp_df), file_name="project1_comparison_2019.csv")
 
-    # Statistical summary
-    st.subheader("Statistical Summary (Training data)")
-    st.table(train_series.describe().to_frame("value"))
-
-    # Downloads and observation
-    st.subheader("Downloads")
-    st.download_button("Download training series (CSV)", df_to_bytes(train_series.to_frame()), file_name="project1_train_2010_2018.csv")
-    st.download_button("Download forecast (CSV)", df_to_bytes(fmean1.to_frame(name="forecast")), file_name="project1_forecast_2019.csv")
-    if "Actual" in comp_df.columns:
-        st.download_button("Download comparison (CSV)", df_to_bytes(comp_df), file_name="project1_comparison_2019.csv")
-
-    st.subheader("Observation")
+    st.markdown("### Observation")
     st.write(
-        "The ARIMA model was trained on monthly closing prices from 2010 to 2018. "
-        "The forecast for 2019 is shown and directly compared with actual 2019 monthly prices (when available). "
-        "Performance metrics are provided for overlapping months. Residual plots and ACF/PACF plots assist in diagnostic assessment. "
-        "Where forecast deviates from actual, this indicates market events or volatility not captured by the stationary model."
+        "The ARIMA model was trained on monthly closing prices from 2010 through 2018. "
+        "The 2019 forecast is shown along with actual 2019 monthly values (when available). Metrics indicate model accuracy over overlapping months. Residuals and statistical summary are provided for diagnostic review."
     )
 
-# ----------------------
-# Project 2
-# ----------------------
 else:
-    st.header("Project 2 — Train: 2021–2025 | Forecast: 2026 (Backtest included)")
+    st.subheader("Project 2 — Train 2021–2025, Forecast 2026 (backtest provided)")
+    train_p2 = series_full.loc["2021-01-01":"2025-12-31"]
+    # Fit on full requested period and forecast out-of-sample
+    fitted_p2, mean_p2, lower_p2, upper_p2 = fit_arima_and_forecast(train_p2, order=order, steps=forecast_months, start_period="2026-01-01")
 
-    train_p2_start = "2021-01-01"
-    train_p2_end = "2025-12-31"
-    forecast_p2_start = "2026-01-01"
+    st.markdown("### Graph 1 — Monthly price movement (2021–2025)")
+    figp = go.Figure(go.Scatter(x=train_p2.index, y=train_p2.values, mode="lines", name="Train"))
+    figp.update_layout(template="simple_white", height=360)
+    st.plotly_chart(figp, use_container_width=True)
 
-    train_p2 = series_full.loc[train_p2_start:train_p2_end]
-    train_p2 = ensure_series_1d(train_p2)
+    st.markdown("### Graph 2 — ARIMA forecast overlaid (2026 forecast shown)")
+    # overlay training + forecast
+    plot_actual_forecast(train_p2, mean_p2, lower_p2, upper_p2, title="Training 2021–2025 + Forecast 2026")
 
-    st.subheader("1) Monthly Price Movement (2021–2025)")
-    fig_p2a = px.line(x=train_p2.index, y=train_p2.values, labels={"x":"Date","y":"Price"}, title="Price (2021–2025)")
-    st.plotly_chart(fig_p2a, use_container_width=True)
+    st.markdown("### Graph 3 — Forecast only (2026)")
+    figp3 = go.Figure(go.Scatter(x=mean_p2.index, y=mean_p2.values, mode="lines", name="Forecast 2026"))
+    figp3.update_layout(template="simple_white", height=360)
+    st.plotly_chart(figp3, use_container_width=True)
 
-    # Fit ARIMA on full 2021-2025 for final forecast
-    with st.spinner("Fitting ARIMA model on 2021–2025..."):
-        fitted_p2 = fit_arima_safe(train_p2, order=order)
-
-    # Forecast out-of-sample 2026
-    fmean_p2, lower_p2, upper_p2 = forecast_with_ci(fitted_p2, steps=12, start_month=forecast_p2_start)
-
-    # Graph 2: overlay
-    st.subheader("2) ARIMA Forecast Overlaid on Actual")
-    actual_2026 = series_full.loc[forecast_p2_start:"2026-12-31"]
-    if len(actual_2026) > 0:
-        actual_2026 = ensure_series_1d(actual_2026)
-    plot_actual_and_forecast(train_p2 if len(actual_2026)==0 else pd.concat([train_p2, actual_2026]), fmean_p2, lower_p2, upper_p2, title="ARIMA Forecast vs Actual (2026 forecast shown)")
-
-    # Graph 3: future forecast
-    st.subheader("3) Future Forecast (2026)")
-    fig_p2g3 = px.line(x=fmean_p2.index, y=fmean_p2.values, labels={"x":"Date","y":"Forecast"}, title="Forecasted Monthly Prices (2026)")
-    st.plotly_chart(fig_p2g3, use_container_width=True)
-
-    # Backtest to obtain real comparison: train on 2021-2024, test on 2025
-    st.subheader("Forecast vs Actual Comparison via Backtest (Train 2021–2024, Test 2025)")
+    # Backtest: train on 2021-2024, test on 2025 for real comparison
+    st.markdown("### Forecast vs Actual Comparison (Backtest: Train 2021–2024, Test 2025)")
     back_train = series_full.loc["2021-01-01":"2024-12-31"]
     back_test = series_full.loc["2025-01-01":"2025-12-31"]
-    back_train = ensure_series_1d(back_train)
-    back_test = ensure_series_1d(back_test)
+    fitted_bt, mean_bt, lb_bt, ub_bt = fit_arima_and_forecast(back_train, order=order, steps=len(back_test), start_period=back_test.index[0] if len(back_test)>0 else "2025-01-01")
 
-    fitted_back = fit_arima_safe(back_train, order=order)
-    fmean_back, lower_back, upper_back = forecast_with_ci(fitted_back, steps=len(back_test), start_month=back_test.index[0] if len(back_test)>0 else "2025-01-01")
-    # Align lengths
-    min_len_b = min(len(back_test), len(fmean_back))
-    comp_p2 = pd.DataFrame({
-        "Actual": back_test.values[:min_len_b],
-        "Forecast": fmean_back.values[:min_len_b]
-    }, index=back_test.index[:min_len_b])
-    st.dataframe(comp_p2.style.format("{:.2f}"))
-
-    # Metrics
-    if len(comp_p2) > 0:
-        mae_p2, rmse_p2, mape_p2 = compute_metrics(comp_p2["Actual"], comp_p2["Forecast"])
+    minlen2 = min(len(back_test), len(mean_bt))
+    if minlen2 > 0:
+        comp2 = pd.DataFrame({"Actual": back_test.values[:minlen2], "Forecast": mean_bt.values[:minlen2]}, index=back_test.index[:minlen2])
+        st.dataframe(comp2.style.format("{:.2f}"))
+        mae2, rmse2, mape2 = compute_metrics(comp2["Actual"], comp2["Forecast"])
         col1, col2, col3 = st.columns(3)
-        col1.metric("MAE (backtest 2025)", f"{mae_p2:.3f}")
-        col2.metric("RMSE (backtest 2025)", f"{rmse_p2:.3f}")
-        col3.metric("MAPE (backtest 2025)", f"{mape_p2:.2f} %")
+        col1.metric("MAE (backtest)", f"{mae2:.3f}")
+        col2.metric("RMSE (backtest)", f"{rmse2:.3f}")
+        col3.metric("MAPE (backtest)", f"{mape2:.2f}%")
     else:
-        st.info("Backtest not possible due to missing 2025 monthly data; final forecast for 2026 is still available.")
+        st.info("Not enough 2025 monthly data found for backtest comparison, but forecast for 2026 is provided for presentation.")
 
-    # Residual diagnostics (full fit)
-    st.subheader("Residual Diagnostics (Full fit 2021–2025)")
+    st.markdown("### Residuals (full fit 2021–2025)")
     resid_p2 = fitted_p2.resid
-    fig_res_p2, axp = plt.subplots(figsize=(9, 3))
-    axp.plot(resid_p2)
-    axp.set_title("Residuals (Full fit)")
-    st.pyplot(fig_res_p2)
+    figp_res = go.Figure(go.Scatter(x=resid_p2.index, y=resid_p2.values, mode="lines", name="Residuals"))
+    figp_res.update_layout(template="simple_white", height=300)
+    st.plotly_chart(figp_res, use_container_width=True)
 
-    # ACF/PACF
-    st.subheader("ACF and PACF (2021–2025)")
-    fig_acf2, axes_acf2 = plt.subplots(1, 2, figsize=(12, 3))
-    plot_acf(train_p2, ax=axes_acf2[0], lags=24, zero=False)
-    plot_pacf(train_p2, ax=axes_acf2[1], lags=24, zero=False, method='ywm')
-    st.pyplot(fig_acf2)
-
-    # Statistical summary
-    st.subheader("Statistical Summary (2021–2025)")
+    st.markdown("### Statistical summary (2021–2025)")
     st.table(train_p2.describe().to_frame("value"))
 
-    # Downloads and observation
-    st.subheader("Downloads")
-    st.download_button("Download training series (CSV)", df_to_bytes(train_p2.to_frame()), file_name="project2_train_2021_2025.csv")
-    st.download_button("Download forecast 2026 (CSV)", df_to_bytes(fmean_p2.to_frame(name="forecast")), file_name="project2_forecast_2026.csv")
-    if len(comp_p2) > 0:
-        st.download_button("Download backtest comparison (CSV)", df_to_bytes(comp_p2), file_name="project2_backtest_comparison_2025.csv")
+    st.download_button("Download training series (CSV)", data=df_to_csv_bytes(train_p2.to_frame("price")), file_name="project2_train_2021_2025.csv")
+    st.download_button("Download forecast 2026 (CSV)", data=df_to_csv_bytes(mean_p2.to_frame("forecast")), file_name="project2_forecast_2026.csv")
+    if minlen2 > 0:
+        st.download_button("Download backtest comparison (CSV)", data=df_to_csv_bytes(comp2), file_name="project2_backtest_comparison_2025.csv")
 
-    st.subheader("Observation")
+    st.markdown("### Observation")
     st.write(
-        "Model fitted on monthly closing prices 2021–2025 produced a 12-month forecast for 2026. "
-        "Since 2026 actual monthly prices are not broadly available yet, a backtest (train on 2021–2024 and test on 2025) is provided to quantify performance on a recent year. "
-        "Backtest metrics show model accuracy on recent data and provide an indicative expectation for the 2026 forecast. Residual plots and ACF/PACF illustrate any remaining autocorrelation needing further modeling."
+        "Final forecast for 2026 is shown along with a backtest for 2025 (model trained on 2021–2024). "
+        "Backtest metrics provide an empirical assessment of model accuracy and help interpret expected forecast reliability. Residuals and summary stats are included for model diagnostics."
     )
